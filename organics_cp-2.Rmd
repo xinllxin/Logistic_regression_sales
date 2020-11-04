@@ -1,0 +1,598 @@
+---
+title: "Tidymodels Organic Project"
+output: html_notebook
+---
+
+
+## Load Libraries 
+
+```{r, warning=FALSE, message=FALSE}
+
+library(C50)
+library(caret)
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(kableExtra)
+library(GGally)
+library(kableExtra) # -- make nice looking resutls when we knitt 
+library(vip)        # --  tidymodels variable importance
+library(fastshap)   # -- shapley values for variable importance 
+library(MASS)
+library(rpart.plot) # -- plotting decision trees 
+library(imputeMissings)
+```
+
+## Load Data
+
+Import your data with read_csv()
+
+```{r}
+odat1 <- read_csv("organics.csv") %>%
+  clean_names()
+
+# remove "rejected" variables from the data frame
+
+odat = subset(odat1, select= -c(id, dem_cluster, target_amt))
+head(odat)
+
+```
+
+## chage target to factor and Profile data
+
+
+```{r}
+
+odat$target_buy <- as.factor(odat$target_buy)
+
+odat %>%
+  skim()
+
+```
+```{r}
+
+odat2 <- impute(odat)
+odat2 %>%
+    skim()
+```
+
+
+
+## Partition your data 70/30 (train / test split) 
+
+
+```{r}
+# -- set a random seed for repeatablity 
+set.seed(43)
+
+# -- performs our train / test split 
+odat_split <- initial_split(odat, prop = 0.7)
+
+# -- extract the training data 
+odat_train <- training(odat_split)
+# -- extract the test data 
+odat_test <- testing(odat_split)
+
+sprintf("Train PCT : %1.2f%%", nrow(odat_train)/ nrow(odat) * 100)
+sprintf("Test  PCT : %1.2f%%", nrow(odat_test)/ nrow(odat) * 100)
+
+head(odat_train)
+
+```
+
+
+## Recipe 
+```{r}
+odat_recipe <- recipe(target_buy ~ ., data = odat) %>%
+  #step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_modeimpute(all_nominal(), -all_outcomes()) %>%
+  step_medianimpute(all_numeric()) %>%
+  #step_naomit() %>%
+    prep()
+
+odat_recipe
+```
+
+## Bake the prediction 
+```{r}
+bake_train <- bake(odat_recipe, new_data = odat_train)
+bake_test  <- bake(odat_recipe, new_data = odat_test)
+```
+
+
+## Fit a logistic model
+
+```{r}
+logistic_glm <-logistic_reg(mode = "classification") %>%
+                  set_engine("glm") %>%
+                  fit(target_buy ~ ., data = bake_train)
+
+## -- check out your parameter estimates ... 
+tidy(logistic_glm) %>%
+  mutate_at(c("estimate", "std.error", "statistic", "p.value"),round, 4)
+
+```
+
+
+
+## Stepwise logistic
+
+```{r}
+
+steplog <- glm(target_buy ~ ., data = bake_train, family=binomial(link="logit"))
+step <- stepAIC(steplog, direction="both")
+summary(step)
+
+```
+```{r}
+
+stepwise_glm <-logistic_reg(mode = "classification") %>%
+                  set_engine("glm") %>%
+                  fit(target_buy ~ dem_affl + dem_age + dem_gender, data = bake_train)
+
+tidy(stepwise_glm) %>%
+  mutate_at(c("estimate", "std.error", "statistic", "p.value"),round, 4)
+
+```
+
+
+## Fit a tree model 
+
+```{r}
+odat_tree <- decision_tree(mode="classification") %>%
+                  set_engine("rpart") %>%
+                  fit(target_buy ~ ., data = odat_train)
+
+
+odat_tree$fit
+
+options(scipen=0)
+rpart.plot(odat_tree$fit, roundint=FALSE, extra = 3)
+
+```
+
+
+## Tuning the cost complexity parameter
+```{r}
+
+set.seed(123)
+treemod <- train(
+                  target_buy ~ dem_cluster_group + dem_gender + dem_reg + dem_tv_reg + prom_class+ 
+                  dem_affl + dem_age + prom_spend + prom_time, 
+                  data = odat2, 
+                  method="rpart",
+                  trControl = trainControl("cv", number = 10),
+                  tuneLength = 
+                  )
+
+#Plot model accuracy vs different values of cp (complexity parameter)
+plot(treemod)
+treemod$bestTune
+
+```
+
+### -  try a diff tree 
+```{r}
+odat_tree2 <- decision_tree(mode="classification",
+                            cost_complexity = 0.0008,
+                            tree_depth = 5,
+                            min_n = 2) %>%
+                  set_engine("rpart") %>%
+                  fit(target_buy ~ ., data=odat_train)
+
+odat_tree2$fit
+
+options(scipen = 0)
+  
+rpart.plot(odat_tree2$fit, roundint=FALSE, extra=3)
+
+```
+## try C5.0 
+```{r}
+odat_tree_c50 <- decision_tree(mode="classification") %>%
+                  set_engine("C5.0") %>%
+                  fit(target_buy ~ ., data=odat_train)
+
+odat_tree2$fit
+
+```
+##try C5.0 in basic R code 
+```{r}
+vars <- c( "dem_cluster_group", "dem_gender", "dem_reg","dem_tv_reg", "prom_class",
+                  "dem_affl", "dem_age", "prom_spend","prom_time")
+
+c5_tree <- C5.0(x = odat_train[,vars], y = odat_train$target_buy)
+
+summary(c5_tree)
+plot(c5_tree)
+
+
+```
+
+
+## Prep for Evaluation (logistic)
+
+
+```{r}
+
+# -- training 
+predict(logistic_glm, bake_train, type = "prob") %>%
+  bind_cols(.,predict(logistic_glm, bake_train)) %>%
+  bind_cols(.,bake_train) -> scored_train_glm
+
+head(scored_train_glm)
+
+# -- testing 
+predict(logistic_glm, bake_test, type = "prob") %>%
+  bind_cols(.,predict(logistic_glm, bake_test)) %>%
+  bind_cols(.,bake_test) -> scored_test_glm
+
+head(scored_test_glm)
+
+
+```
+
+## Evaluate
+
+
+```{r}
+
+# -- AUC: Train and Test 
+scored_train_glm %>% 
+  metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_glm %>% 
+               metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+               mutate(part="testing") 
+  ) 
+  
+
+
+# -- Variable Importance top 10 features  
+logistic_glm %>%
+  vip(num_features = 5)
+
+# -- ROC Charts 
+options(yardstick.event_first = FALSE) #reverse roc 
+scored_train_glm %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_test_glm %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(target_buy, .pred_1) %>%
+  autoplot()
+
+
+# -- Confustion Matricies  
+scored_train_glm %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_glm %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+
+
+
+```
+## Prep for Evaluation (logistic stepwise)
+
+
+```{r}
+
+# -- training 
+predict(stepwise_glm, bake_train, type = "prob") %>%
+  bind_cols(.,predict(stepwise_glm, bake_train)) %>%
+  bind_cols(.,bake_train) -> scored_train_stepwise
+
+head(scored_train_stepwise)
+
+# -- testing 
+predict(stepwise_glm, bake_test, type = "prob") %>%
+  bind_cols(.,predict(stepwise_glm, bake_test)) %>%
+  bind_cols(.,bake_test) -> scored_test_stepwise
+
+head(scored_test_stepwise)
+
+
+
+```
+
+## Evaluate
+
+
+```{r}
+
+# -- AUC: Train and Test 
+scored_train_stepwise %>% 
+  metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_stepwise %>% 
+               metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+               mutate(part="testing") 
+  ) 
+  
+
+
+# -- Variable Importance top 10 features  
+stepwise_glm %>%
+  vip(num_features = 5)
+
+# -- ROC Charts 
+options(yardstick.event_first = FALSE) #reverse roc 
+scored_train_stepwise %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_test_stepwise %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(target_buy, .pred_1) %>%
+  autoplot()
+
+
+# -- Confustion Matricies  
+scored_train_stepwise %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_stepwise %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+
+
+
+```
+
+
+
+## Prep for Evaluation (odat tree)
+
+
+```{r}
+
+# -- training 
+predict(odat_tree, odat_train, type = "prob") %>%
+  bind_cols(.,predict(odat_tree, odat_train)) %>%
+  bind_cols(.,odat_train) -> scored_train_tree
+
+head(scored_train_tree)
+
+# -- testing 
+predict(odat_tree, odat_test, type = "prob") %>%
+  bind_cols(.,predict(odat_tree, odat_test)) %>%
+  bind_cols(.,odat_test) -> scored_test_tree
+
+head(scored_test_tree)
+```
+
+## Evaluate
+
+
+```{r}
+
+# -- AUC: Train and Test 
+scored_train_tree %>% 
+  metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_tree %>% 
+               metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+               mutate(part="testing") 
+  ) 
+  
+
+
+# -- Variable Importance top 10 features  
+odat_tree %>%
+  vip(num_features = 5)
+
+# -- ROC Charts 
+scored_train_tree %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_test_tree %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(target_buy, .pred_1) %>%
+  autoplot()
+
+
+# -- Confustion Matricies  
+scored_train_tree %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_tree %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+
+
+
+```
+
+
+## Prep for Evaluation (odat tree2)
+
+
+```{r}
+
+# -- training 
+predict(odat_tree2, odat_train, type = "prob") %>%
+  bind_cols(.,predict(odat_tree2, odat_train)) %>%
+  bind_cols(.,odat_train) -> scored_train_tree2
+
+head(scored_train_tree2)
+
+# -- testing 
+predict(odat_tree2, odat_test, type = "prob") %>%
+  bind_cols(.,predict(odat_tree2, odat_test)) %>%
+  bind_cols(.,odat_test) -> scored_test_tree2
+
+head(scored_test_tree2)
+```
+
+## Evaluate
+
+
+```{r}
+
+# -- AUC: Train and Test 
+scored_train_tree2 %>% 
+  metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_tree2 %>% 
+               metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+               mutate(part="testing") 
+  ) 
+  
+
+
+# -- Variable Importance top 10 features  
+odat_tree2 %>%
+  vip(num_features = 5)
+
+# -- ROC Charts 
+scored_train_tree2 %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_test_tree2 %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(target_buy, .pred_1) %>%
+  autoplot()
+
+
+# -- Confustion Matricies  
+scored_train_tree2 %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_tree2 %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+
+
+
+```
+
+## Prep for Evaluation (odat C5.0)
+
+
+```{r}
+
+# -- training 
+predict(odat_tree_c50, bake_train, type = "prob") %>%
+  bind_cols(.,predict(odat_tree_c50, bake_train)) %>%
+  bind_cols(.,bake_train) -> scored_train_tree_c50
+
+head(scored_train_tree_c50)
+
+# -- testing 
+predict(odat_tree_c50, bake_test, type = "prob") %>%
+  bind_cols(.,predict(odat_tree2, bake_test)) %>%
+  bind_cols(.,bake_test) -> scored_test_tree_c50
+
+head(scored_test_tree_c50)
+```
+
+## Evaluate
+
+
+```{r}
+
+# -- AUC: Train and Test 
+scored_train_tree_c50 %>% 
+  metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+  mutate(part="training") %>%
+  bind_rows( scored_test_tree2 %>% 
+               metrics(target_buy, .pred_1, estimate = .pred_class) %>%
+               mutate(part="testing") 
+  ) 
+  
+
+
+# -- Variable Importance top 10 features  
+odat_tree_c50 %>%
+  vip(num_features = 5)
+
+# -- ROC Charts 
+scored_train_tree_c50 %>%
+  mutate(model = "train") %>%
+  bind_rows(scored_test_tree2 %>%
+              mutate(model="test")) %>%
+  group_by(model) %>%
+  roc_curve(target_buy, .pred_1) %>%
+  autoplot()
+
+
+# -- Confustion Matricies  
+scored_train_tree_c50 %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Train Confusion Matrix")
+
+scored_test_tree_c50 %>%
+  conf_mat(target_buy, .pred_class) %>%
+  autoplot( type = "heatmap") +
+  labs(title="Test Confusion Matrix")
+
+
+
+
+```
+
+
+
+## Load Holdout Data
+
+Import your data with read_csv()
+
+```{r}
+new_odat1 <- read_csv("New_organics.csv") %>%
+  clean_names()
+
+# remove "rejected" variables from the data frame
+
+new_odat = subset(new_odat1, select= -c(id, dem_cluster))
+head(new_odat)
+
+
+```
+
+```{r}
+
+new_odat <- impute(new_odat)
+new_odat %>%
+    skim()
+```
+
+## Bake
+```{r}
+bake_holdout <- bake(odat_recipe, new_data = new_odat)
+```
+
+## Apply model 
+
+
+```{r}
+
+predict(odat_tree2, new_odat, type = "prob") %>%
+  bind_cols(.,predict(odat_tree2, new_odat)) %>%
+  bind_cols(.,new_odat) -> scored_train_tree_new
+
+head(scored_train_tree_new)
+
+```
+```{r}
+write.csv(scored_train_tree_new,"scored_train_tree_new.csv")
+```
+
